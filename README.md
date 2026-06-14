@@ -66,7 +66,7 @@ VisionChef/
 | 김진명 | LLM | [@JM-KIMM](https://github.com/JM-KIMM) |
 | 이시은 | LLM | [@siikko](https://github.com/siikko) |
 | 이승진 | CV | [@L-SeungJin](https://github.com/L-SeungJin) |
-
+ 
 <br>
 
 ---
