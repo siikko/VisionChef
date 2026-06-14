@@ -62,9 +62,9 @@ VisionChef/
 
 | 이름 | 역할 | GitHub |
 |------|------|--------|
+| 강민솔 | CV | [@min8-8](https://github.com/min8-8) |
 | 김진명 | LLM | [@JM-KIMM](https://github.com/JM-KIMM) |
 | 이시은 | LLM | [@siikko](https://github.com/siikko) |
-| 강민솔 | CV | [@min8-8](https://github.com/min8-8) |
 | 이승진 | CV | [@L-SeungJin](https://github.com/L-SeungJin) |
 
 <br>
