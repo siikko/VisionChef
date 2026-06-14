@@ -1,0 +1,1547 @@
+import os
+import re
+import sys
+import json
+import io
+import base64
+from getpass import getpass
+from pathlib import Path
+from contextlib import asynccontextmanager
+from typing import Optional
+import tempfile
+import threading
+import requests
+
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
+
+# ⚠️ Hugging Face / Transformers 캐시는 관련 라이브러리 import 전에 잡아둔다.
+# 기존 코드는 D:\models를 사용했지만, D 드라이브가 없는 PC에서는 서버 시작이 실패한다.
+# 현재 server.py 기준으로 프로젝트 루트(UI)를 계산하고, UI/models 아래에 LLM 캐시/모델을 저장한다.
+_THIS_FILE = Path(__file__).resolve()
+MODULE_DIR = _THIS_FILE.parent                  # UI/WEB/Backend
+PROJECT_DIR = MODULE_DIR.parent                # UI/WEB
+VISIONCHEF_ROOT = PROJECT_DIR.parent           # UI
+
+DEFAULT_HF_HOME = Path(os.environ.get("HF_HOME", str(VISIONCHEF_ROOT / ".hf_cache")))
+DEFAULT_HF_HUB_CACHE = DEFAULT_HF_HOME / "hub"
+DEFAULT_TRANSFORMERS_CACHE = DEFAULT_HF_HOME / "transformers"
+DEFAULT_LOCAL_MODEL_DIR = DEFAULT_HF_HOME / "skt_A.X-4.0-Light"
+
+DEFAULT_HF_HOME.mkdir(parents=True, exist_ok=True)
+DEFAULT_HF_HUB_CACHE.mkdir(parents=True, exist_ok=True)
+DEFAULT_TRANSFORMERS_CACHE.mkdir(parents=True, exist_ok=True)
+
+os.environ["HF_HOME"] = str(DEFAULT_HF_HOME)
+os.environ["HF_HUB_CACHE"] = str(DEFAULT_HF_HUB_CACHE)
+os.environ["HUGGINGFACE_HUB_CACHE"] = str(DEFAULT_HF_HUB_CACHE)
+os.environ["TRANSFORMERS_CACHE"] = str(DEFAULT_TRANSFORMERS_CACHE)
+os.environ["HF_HUB_DISABLE_EXPERIMENTAL_XET"] = "1"
+os.environ["HF_HUB_DISABLE_XET"] = "1"
+
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+from openai import OpenAI as RunYourClient
+from fastapi import FastAPI, BackgroundTasks, HTTPException, File, UploadFile, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList, pipeline
+from huggingface_hub import login, snapshot_download
+import pygame
+import time
+from starlette.concurrency import run_in_threadpool
+
+try:
+    import numpy as np
+    import cv2
+    from ultralytics import YOLO as YOLODetector
+    _yolo_available = True
+except ImportError:
+    _yolo_available = False
+    print("⚠️ YOLO/OpenCV 라이브러리 없음 — /detect 엔드포인트 비활성화")
+
+_mediapipe_available = False
+_hand_landmarker = None
+try:
+    if _yolo_available:
+        import urllib.request as _urllib_req
+        import mediapipe as mp
+        from mediapipe.tasks import python as _mp_python
+        from mediapipe.tasks.python import vision as _mp_vision
+        _mp_model_path = str(Path(tempfile.gettempdir()) / "hand_landmarker.task")
+        if not Path(_mp_model_path).exists():
+            print("⬇️ MediaPipe 손 랜드마크 모델 다운로드 중...")
+            _urllib_req.urlretrieve(
+                "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+                _mp_model_path,
+            )
+        _hand_landmarker = _mp_vision.HandLandmarker.create_from_options(
+            _mp_vision.HandLandmarkerOptions(
+                base_options=_mp_python.BaseOptions(model_asset_path=_mp_model_path),
+                running_mode=_mp_vision.RunningMode.IMAGE,
+                num_hands=1,
+                min_hand_detection_confidence=0.7,
+                min_hand_presence_confidence=0.7,
+                min_tracking_confidence=0.7,
+            )
+        )
+        _mediapipe_available = True
+        print("✅ MediaPipe 손 인식 준비 완료")
+except Exception as _mp_err:
+    print(f"⚠️ MediaPipe 초기화 실패 — /gesture 비활성화: {_mp_err}")
+
+
+def detect_hand_gesture(image_bytes: bytes) -> str:
+    if not _mediapipe_available or _hand_landmarker is None:
+        return "NONE"
+    data = np.frombuffer(image_bytes, dtype=np.uint8)
+    frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if frame is None:
+        return "NONE"
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    result = _hand_landmarker.detect(mp_image)
+    if not result.hand_landmarks:
+        return "NONE"
+    lm = result.hand_landmarks[0]
+    fingers = []
+    for tip, pip, mcp in [(8, 6, 5), (12, 10, 9), (16, 14, 13), (20, 18, 17)]:
+        fingers.append(1 if lm[tip].y < lm[pip].y and lm[tip].y < lm[mcp].y else 0)
+    thumb_up = lm[4].y < lm[3].y and lm[4].y < lm[5].y
+    if fingers == [1, 1, 1, 1] and thumb_up:
+        return "OPEN_HAND"
+    if fingers == [0, 0, 0, 0] and thumb_up:
+        return "THUMBS_UP"
+    if fingers[0] == 1 and fingers[1] == 1 and fingers[2] == 0 and fingers[3] == 0:
+        return "PEACE"
+    if fingers == [0, 0, 0, 0] and not thumb_up:
+        return "FIST"
+    return "NONE"
+
+# 프로젝트 루트 기준 경로 계산 후 sys.path 추가
+_THIS_FILE   = Path(__file__).resolve()
+_WEB_DIR     = _THIS_FILE.parent.parent          # C:\VisionChef\WEB
+_ROOT_DIR    = _WEB_DIR.parent                   # C:\VisionChef
+_LLM_DIR     = _ROOT_DIR / "LLM"                 # C:\VisionChef\LLM
+sys.path.insert(0, str(_LLM_DIR))
+sys.path.insert(0, str(_LLM_DIR / "RAG"))
+
+from RAG.rag import (
+    load_recipes,
+    build_vectorstore,
+    search_recipes,
+    normalize_ingredient,
+)
+from youtube_api import (
+    find_best_youtube_segment,
+    get_last_youtube_error,
+    get_video_transcript,
+    is_cooking_video_query,
+)
+
+MODULE_DIR       = _THIS_FILE.parent                          # C:\VisionChef\WEB\Backend
+PROJECT_DIR      = MODULE_DIR.parent                          # C:\VisionChef\WEB
+VISIONCHEF_ROOT  = PROJECT_DIR.parent                         # C:\VisionChef
+RAG_DATA_DIR     = VISIONCHEF_ROOT / "LLM" / "RAG" / "data"
+BOOK_RECIPES_FILE     = str(RAG_DATA_DIR / "baek_book_recipes.json")
+TRENDING_RECIPES_FILE = str(RAG_DATA_DIR / "trending_recipes.json")
+CUSTOM_RECIPES_FILE   = str(RAG_DATA_DIR / "custom_recipes.json")
+YOUTUBE_RECIPES_FILE  = str(RAG_DATA_DIR / "youtube_recipes.json")
+CHROMA_PATH      = str(VISIONCHEF_ROOT / "LLM" / "RAG" / "chroma_db")
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    values = {}
+    if not path.exists():
+        return values
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        name, value = line.split("=", 1)
+        values[name.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def get_runtime_env(name: str) -> Optional[str]:
+    return (
+        os.getenv(name)
+        or read_env_file(MODULE_DIR / ".env").get(name)
+        or read_env_file(PROJECT_DIR / ".env").get(name)
+        or read_env_file(VISIONCHEF_ROOT / ".env").get(name)
+    )
+
+# ==========================================
+# ⚙️ 설정, 모델 로드, RAG 초기화
+# ==========================================
+pipe = None
+vectorstore = None # RAG 벡터 저장소
+recipe_documents = []
+loaded_model_source = None
+loaded_quantization = "none"
+rag_error = None
+rag_mode = "none"
+last_video_recommendation = None  # 가장 최근 추천된 유튜브 영상 (자막 질의응답용)
+tts_lock = threading.Lock()
+generation_lock = threading.Lock()
+generation_state_lock = threading.Lock()
+generation_cancel_event = threading.Event()
+generation_active = False
+SERVER_TTS_ENABLED = os.getenv("ENABLE_SERVER_TTS", "0").strip().lower() in {"1", "true", "yes", "on"}
+VARCO_TTS_KEY = os.getenv("VARCO_TTS_KEY", "")
+VARCO_TTS_VOICE: Optional[str] = "32f824eb-3a9b-5964-b48f-c926d4b835ab"
+LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "skt/A.X-4.0-Light")
+LLM_LOCAL_MODEL_DIR = os.getenv("LLM_LOCAL_MODEL_DIR", DEFAULT_LOCAL_MODEL_DIR)
+LLM_LOAD_IN_8BIT = os.getenv("LLM_LOAD_IN_8BIT", "0").strip().lower() in {"1", "true", "yes", "on"}
+SYSTEM_PROMPT = """너는 사용자 옆에서 같이 요리하는 만능 셰프야.
+말투는 사람과 대화하듯 자연스럽고 친근하게 해. 사용자를 가르치는 설명서가 아니라, 지금 주방에서 같이 조리하는 셰프처럼 반응해.
+항상 존댓말로 말해. 반말, 친구 말투, 명령조는 절대 쓰지 말고 "~요", "~세요", "~합니다" 형태로만 답해.
+절대로 "~다", "~한다", "~준다", "~담는다" 같은 서술형 원문을 그대로 말하지 마. 이런 문체가 나오면 반드시 "~해주세요", "~하시면 돼요", "~하시면 됩니다"로 바꿔서 말해.
+예시: "그릇에 밥을 담는다" → "그릇에 밥을 담아주세요", "볶아서 식힌다" → "볶아서 식혀주세요"
+재료 손질, 조리 순서, 대체 재료, 간 맞추기, 실패 수습, 보관법, 플레이팅까지 폭넓게 도와줘.
+사용자의 말이 짧거나 애매하면 먼저 상황을 짚고, 필요한 질문은 한 가지만 물어봐.
+레시피 추천은 먼저 참고 문서의 RAG 결과를 우선해. RAG 결과가 없으면 네 일반 요리 지식으로 답해도 된다.
+단, 어떤 경우에도 현재 인식된 재료나 사용자가 말한 보유 재료로 만들 수 있는 음식만 추천해. 사용자가 가지고 있지 않은 재료가 꼭 필요한 레시피는 추천하지 마.
+현재 사용 가능한 재료 목록에 없는 식재료, 양념, 토핑, 고명은 새로 꺼내지 마. 기본재료도 목록에 포함되어 있을 때만 사용할 수 있어.
+요리 실행을 안내할 때는 반드시 아래 방식을 지켜.
+지금 사용자가 바로 실행할 한 단계만 말해. 전체 레시피, 전체 순서, 다음 단계 목록을 한 번에 말하지 마.
+한 단계 안에서는 꼭 필요한 양, 불 세기, 시간, 상태 기준만 짚어.
+답변은 2문장 이상 4문장 이하로 짧게 말해. 요리 중 듣기 부담스럽지 않게 핵심만 말해.
+사용자가 "다 했어", "다음", "계속", "했어"처럼 진행 신호를 주면 그때 다음 단계로 넘어가.
+사용자가 전체 레시피를 물어도 전체를 나열하지 말고, 먼저 시작 단계부터 같이 진행해.
+절대 *, #, - 같은 기호나 번호 목록을 쓰지 말고 구어체로만 답해.
+문서 내용과 관련된 질문이면 아래 참고 문서 내용을 바탕으로 답하되, 사용자의 현재 조리 상황과 대화를 우선해.
+---
+[참고 문서 내용]
+{rag_context}
+---
+"""
+
+
+# ==========================================
+# 🤖 에이전트 도구 (LLM이 스스로 호출)
+# ==========================================
+_YOUTUBE_TOOL_DESC = (
+    "- search_youtube_video — 유튜브 요리 영상 검색.\n"
+    "  사용자가 영상, 유튜브, 시연을 직접 보고 싶다고 하거나, "
+    "칼질·재료 손질·반죽·플레이팅처럼 말로만 설명하기 어려워서 영상이 확실히 도움이 될 때 호출해.\n"
+)
+_RECIPE_TOOL_DESC = (
+    "- search_recipe — 보유한 레시피 문서를 요리 이름으로 검색.\n"
+    "  사용자가 특정 요리의 만드는 법을 묻는데 위 참고 문서에 그 레시피가 없을 때만 호출해. "
+    "참고 문서에 이미 있으면 호출하지 마.\n"
+)
+_TIMER_TOOL_DESC = (
+    "- set_timer — 조리 타이머 설정 (화면에서 자동 시작됨).\n"
+    "  사용자가 타이머를 부탁하거나, 지금 안내하는 단계에 몇 분간 삶기·끓이기·굽기처럼 "
+    "시간이 정해진 조리가 있으면 호출해. query에는 분 단위 숫자만 넣어. 예: \"8\"\n"
+)
+_STEP_TOOL_DESC = (
+    "- goto_step — 조리 단계 화면 이동.\n"
+    "  사용자가 '양파 볶는 단계로 돌아가줘', '두 단계 건너뛰어', '3단계로 가자'처럼 "
+    "다른 단계로 이동하길 원하면 호출해. query에는 이동할 단계 번호 숫자만 넣어. 예: \"3\"\n"
+)
+_TRANSCRIPT_TOOL_DESC = (
+    "- read_video_transcript — 방금 추천한 유튜브 영상의 자막 읽기.\n"
+    "  사용자가 추천된 영상의 내용(불 세기, 시간, 양념 비율 등)을 물어보면 호출해. "
+    "query에는 사용자가 궁금해하는 내용을 짧게 넣어.\n"
+)
+
+
+def build_agent_tool_prompt(
+    youtube_enabled: bool,
+    steps_enabled: bool = False,
+    transcript_enabled: bool = False,
+) -> str:
+    tool_descs = (
+        (_YOUTUBE_TOOL_DESC if youtube_enabled else "")
+        + _RECIPE_TOOL_DESC
+        + _TIMER_TOOL_DESC
+        + (_STEP_TOOL_DESC if steps_enabled else "")
+        + (_TRANSCRIPT_TOOL_DESC if transcript_enabled else "")
+    )
+    return (
+        "\n[도구 사용 안내]\n"
+        "너는 아래 도구들을 스스로 판단해서 호출할 수 있어.\n"
+        f"{tool_descs}"
+        "도구를 호출할 때는 다른 말은 하나도 하지 말고 아래 형식 한 줄만 정확히 출력해:\n"
+        '<tool_call>{"tool": "도구이름", "query": "검색어"}</tool_call>\n'
+        "검색 도구의 query에는 네가 직접 만든 짧은 한국어 검색어를 넣어. "
+        "사용자의 말을 그대로 복사하지 말고 핵심 요리 이름이나 기술 위주로 다듬어. "
+        "set_timer와 goto_step의 query에는 숫자만 넣어.\n"
+        "도구가 필요 없는 일반 질문에는 절대 도구를 호출하지 말고 평소처럼 말로만 답해.\n"
+    )
+
+TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*(?:</tool_call>)?", re.DOTALL)
+AGENT_TOOL_NAMES = {
+    "search_youtube_video",
+    "search_recipe",
+    "set_timer",
+    "goto_step",
+    "read_video_transcript",
+}
+MAX_AGENT_STEPS = 3
+
+
+def parse_tool_call(text: str) -> Optional[dict]:
+    match = TOOL_CALL_RE.search(text)
+    if not match:
+        return None
+
+    try:
+        payload = json.loads(match.group(1))
+    except ValueError:
+        return None
+
+    tool = payload.get("tool")
+    if tool not in AGENT_TOOL_NAMES:
+        return None
+
+    query = str(payload.get("query", "")).strip()
+    if not query:
+        return None
+    return {"tool": tool, "query": query}
+
+
+def strip_tool_calls(text: str) -> str:
+    return TOOL_CALL_RE.sub("", text).strip()
+
+
+def _format_tool_result(video: Optional[dict]) -> str:
+    if not video:
+        return "검색 결과 없음: 관련 영상을 찾지 못했습니다."
+
+    lines = [
+        f"영상 제목: {video.get('title', '')}",
+        f"채널: {video.get('channel_title', '')}",
+    ]
+    segments = video.get("best_segments") or []
+    if video.get("timeline_found") and segments:
+        first = segments[0]
+        snippet = (first.get("raw_text") or first.get("text") or "")[:120]
+        lines.append(f"추천 구간: {first.get('start_seconds', 0)}초부터 (내용: {snippet})")
+    return "\n".join(lines)
+
+
+def _search_recipe_by_name(dish: str, top_k: int = 2) -> list[dict]:
+    dish_norm = re.sub(r"\s+", "", dish).lower()
+    if not dish_norm:
+        return []
+
+    def _grams(text: str) -> set[str]:
+        if len(text) < 2:
+            return {text} if text else set()
+        return {text[i : i + 2] for i in range(len(text) - 1)}
+
+    dish_grams = _grams(dish_norm)
+    scored = []
+    for doc in recipe_documents:
+        title = doc.metadata.get("title", "")
+        title_norm = re.sub(r"\s+", "", title).lower()
+        if not title_norm:
+            continue
+
+        if dish_norm in title_norm or title_norm in dish_norm:
+            score = 2.0
+        else:
+            score = len(dish_grams & _grams(title_norm)) / max(1, len(dish_grams))
+            if score < 0.5:
+                continue
+        scored.append((score, doc))
+
+    scored.sort(key=lambda item: -item[0])
+    return [
+        {
+            "title": doc.metadata.get("title", ""),
+            "ingredients": doc.metadata.get("ingredients", ""),
+            "steps": doc.metadata.get("steps", ""),
+            "source_type": doc.metadata.get("source_type", ""),
+        }
+        for _, doc in scored[:top_k]
+    ]
+
+
+def _format_recipe_tool_result(recipes: list[dict]) -> str:
+    if not recipes:
+        return "검색 결과 없음: 해당 요리의 레시피 문서를 찾지 못했습니다."
+
+    lines = []
+    for recipe in recipes:
+        steps = recipe.get("steps", "")
+        if len(steps) > 600:
+            steps = steps[:600] + "..."
+        lines.append(f"레시피: {recipe.get('title', '')}")
+        lines.append(f"재료: {recipe.get('ingredients', '')}")
+        lines.append(f"조리 순서: {steps}")
+    return "\n".join(lines)
+
+
+def _extract_first_number(text: str) -> int:
+    match = re.search(r"\d+(?:\.\d+)?", text)
+    if not match:
+        return 0
+    return int(float(match.group()))
+
+
+def _fetch_transcript_text(video: Optional[dict], max_chars: int = 1800) -> str:
+    video_id = (video or {}).get("video_id", "")
+    if not video_id:
+        return ""
+    transcript = get_video_transcript(video_id)
+    if not transcript:
+        return ""
+    joined = " ".join(
+        str(segment.get("text", "")).strip()
+        for segment in transcript
+        if str(segment.get("text", "")).strip()
+    )
+    return joined[:max_chars]
+
+
+class GenerationCancelled(Exception):
+    pass
+
+
+class CancelStoppingCriteria(StoppingCriteria):
+    def __init__(self, cancel_event: threading.Event):
+        self.cancel_event = cancel_event
+
+    def __call__(self, input_ids, scores, **kwargs) -> bool:
+        return self.cancel_event.is_set()
+
+
+def set_generation_active(active: bool) -> None:
+    global generation_active
+    with generation_state_lock:
+        generation_active = active
+
+
+def is_generation_active() -> bool:
+    with generation_state_lock:
+        return generation_active
+
+
+def generate_llm_answer(prompt: str) -> str:
+    if pipe is None:
+        raise RuntimeError("LLM model is not loaded yet.")
+
+    if not generation_lock.acquire(blocking=False):
+        raise RuntimeError("이미 답변을 생성하는 중입니다. 먼저 중단하거나 잠시 기다려주세요.")
+
+    generation_cancel_event.clear()
+    set_generation_active(True)
+    try:
+        outputs = pipe(
+            prompt,
+            max_new_tokens=240,
+            do_sample=True,
+            temperature=0.62,
+            repetition_penalty=1.08,
+            eos_token_id=pipe.tokenizer.eos_token_id,
+            pad_token_id=pipe.tokenizer.pad_token_id,
+            stopping_criteria=StoppingCriteriaList([CancelStoppingCriteria(generation_cancel_event)]),
+        )
+        if generation_cancel_event.is_set():
+            raise GenerationCancelled()
+        full_text = outputs[0]["generated_text"]
+        return full_text.split("<|im_start|>assistant\n")[-1].strip()
+    finally:
+        set_generation_active(False)
+        generation_lock.release()
+
+def has_hf_hub_cache(repo_id: str) -> bool:
+    """
+    예: skt/A.X-4.0-Light -> UI/.hf_cache/hub/models--skt--A.X-4.0-Light
+    """
+    if "/" not in repo_id:
+        return False
+
+    namespace, model_name = repo_id.split("/", 1)
+    cache_dir = DEFAULT_HF_HUB_CACHE / f"models--{namespace}--{model_name}"
+    return cache_dir.exists()
+
+def has_local_model(model_dir: str) -> bool:
+    path = Path(model_dir)
+    if not path.exists() or not path.is_dir():
+        return False
+
+    has_config = (path / "config.json").exists()
+    has_weights = any(path.glob("*.safetensors")) or any(path.glob("*.bin"))
+    return has_config and has_weights
+
+
+def get_hf_token(required: bool) -> Optional[str]:
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    if not token and required:
+        token = getpass("Hugging Face token을 입력하세요: ").strip()
+
+    if required and not token:
+        raise ValueError("로컬 모델이 없어 다운로드가 필요합니다. HF_TOKEN을 입력해주세요.")
+
+    if token:
+        login(token=token, add_to_git_credential=False)
+        os.environ["HF_TOKEN"] = token
+
+    return token
+
+
+def resolve_model_source() -> str:
+    local_model_dir = os.getenv("LLM_LOCAL_MODEL_DIR", str(DEFAULT_LOCAL_MODEL_DIR))
+
+    # 1. 직접 풀린 로컬 모델 폴더가 있으면 그걸 사용
+    if has_local_model(local_model_dir):
+        print(f"📦 로컬 A.X 모델 사용: {local_model_dir}")
+        get_hf_token(required=False)
+        return local_model_dir
+
+    # 2. HuggingFace hub 캐시가 있으면 repo_id로 불러오되, 캐시 폴더를 사용
+    if has_hf_hub_cache(LLM_MODEL_ID):
+        print(f"📦 HuggingFace 캐시 모델 사용: {DEFAULT_HF_HUB_CACHE}")
+        get_hf_token(required=False)
+        return LLM_MODEL_ID
+
+    # 3. 둘 다 없으면 다운로드 필요
+    print(f"📦 로컬 모델 없음: {local_model_dir}")
+    print(f"⬇️ Hugging Face 캐시에 {LLM_MODEL_ID} 다운로드를 시작합니다.")
+    get_hf_token(required=True)
+    return LLM_MODEL_ID
+
+
+def build_quantization_config():
+    global loaded_quantization
+
+    if not LLM_LOAD_IN_8BIT:
+        loaded_quantization = "none"
+        return None
+
+    if not torch.cuda.is_available():
+        print("⚠️ 8bit 양자화는 CUDA 환경에서만 사용하도록 설정했습니다. 일반 로드로 전환합니다.")
+        loaded_quantization = "none"
+        return None
+
+    try:
+        from transformers import BitsAndBytesConfig
+    except ImportError:
+        print("⚠️ bitsandbytes가 없어 8bit 양자화를 적용하지 못했습니다. 일반 로드로 전환합니다.")
+        loaded_quantization = "none"
+        return None
+
+    loaded_quantization = "8bit"
+    return BitsAndBytesConfig(load_in_8bit=True)
+
+
+def load_llm_pipeline(model_source: str):
+    quantization_config = build_quantization_config()
+    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+    # 모델 소스가 repo_id이면 HF hub 캐시를 사용
+    use_hf_repo_id = "/" in model_source
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_source,
+        trust_remote_code=True,
+        cache_dir=str(DEFAULT_HF_HUB_CACHE) if use_hf_repo_id else None,
+        token=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN"),
+    )
+
+    model_kwargs = {
+        "device_map": "auto",
+        "trust_remote_code": True,
+    }
+
+    if use_hf_repo_id:
+        model_kwargs["cache_dir"] = str(DEFAULT_HF_HUB_CACHE)
+        model_kwargs["token"] = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+
+    if quantization_config is not None:
+        model_kwargs["quantization_config"] = quantization_config
+    else:
+        model_kwargs["torch_dtype"] = torch_dtype
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_source,
+        **model_kwargs,
+    )
+
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    return pipeline(
+        "text-generation",
+        model=model,
+        tokenizer=tokenizer,
+    )
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 서버 시작 시 실행
+    global pipe, vectorstore, recipe_documents, loaded_model_source, rag_error, rag_mode, yolo_model
+    print("🚀 서버 시작...")
+
+    if VARCO_TTS_KEY:
+        print(f"✅ VARCO TTS 준비 완료 (그리핀/데이비드: {VARCO_TTS_VOICE})")
+    else:
+        print("⚠️ VARCO_TTS_KEY 없음 — TTS 비활성화")
+
+    # LLM 모델 로드 (SKIP_LLM=1 이면 건너뜀)
+    skip_llm = os.getenv("SKIP_LLM", "0").strip().lower() in {"1", "true", "yes"}
+    if skip_llm:
+        print("⚠️ LLM 스킵 모드 — /ask 엔드포인트 비활성화")
+    else:
+        loaded_model_source = resolve_model_source()
+        print(f"🧠 A.X 로딩 중... source={loaded_model_source}")
+        pipe = load_llm_pipeline(loaded_model_source)
+        print(f"✅ A.X 모델 준비 완료! quantization={loaded_quantization}")
+
+    # RAG 벡터 저장소 로드 또는 생성
+    chroma_path = CHROMA_PATH
+
+    book_docs = load_recipes(BOOK_RECIPES_FILE, source_type="Baek_Book")
+    trending_docs = load_recipes(TRENDING_RECIPES_FILE, source_type="trending")
+    custom_docs = load_recipes(CUSTOM_RECIPES_FILE, source_type="custom") if Path(CUSTOM_RECIPES_FILE).exists() else []
+    youtube_docs = load_recipes(YOUTUBE_RECIPES_FILE, source_type="youtube") if Path(YOUTUBE_RECIPES_FILE).exists() else []
+    recipe_documents = book_docs + trending_docs + custom_docs + youtube_docs
+
+    try:
+        vectorstore = build_vectorstore(recipe_documents, chroma_path)
+        rag_error = None
+        rag_mode = "vector"
+        print("✅ RAG 벡터 검색 준비 완료")
+    except Exception as exc:
+        vectorstore = None
+        rag_error = str(exc)
+        rag_mode = "fallback" if recipe_documents else "none"
+        print(f"⚠️ RAG 벡터 초기화 실패. JSON fallback 검색으로 계속 실행합니다: {exc}")
+
+    # YOLO 모델 로드
+    if _yolo_available:
+        if YOLO_MODEL_PATH.exists():
+            try:
+                yolo_model = YOLODetector(str(YOLO_MODEL_PATH))
+                print(f"✅ YOLO 모델 준비 완료: {YOLO_MODEL_PATH}")
+            except Exception as e:
+                print(f"⚠️ YOLO 모델 로드 실패: {e}")
+        else:
+            print(f"⚠️ YOLO 모델 파일 없음: {YOLO_MODEL_PATH}")
+
+    yield
+    # 서버 종료 시 실행 (여기서는 특별한 정리 작업 없음)
+    print("🌙 서버 종료...")
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+current_ingredients = []
+pending_ingredients = []
+cached_rag_context = "없음"
+chat_history = []
+cached_rag_matches = []
+community_posts: list[dict] = []
+yolo_model = None
+YOLO_MODEL_PATH = Path(os.getenv("YOLO_MODEL_PATH", str(VISIONCHEF_ROOT / "CV" / "model" / "best.pt")))
+FRONTEND_BUILD_DIR = PROJECT_DIR / "Frontend" / "build"
+
+# 레퍼런스 이미지 캐시 (서버 시작 시 1회 로드)
+_ref_image_contents: list[dict] = []
+for _p, _m in [
+    (VISIONCHEF_ROOT / "WEB" / "food1.jpg", "image/jpeg"),
+    (VISIONCHEF_ROOT / "WEB" / "food2.png", "image/png"),
+]:
+    if _p.exists():
+        with open(_p, "rb") as _f:
+            _b64 = base64.b64encode(_f.read()).decode()
+        _ref_image_contents.append({"inline_data": {"mime_type": _m, "data": _b64}})
+print(f"✅ 레퍼런스 이미지 {len(_ref_image_contents)}장 캐시 완료")
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "llm_loaded": pipe is not None,
+        "rag_loaded": vectorstore is not None or bool(recipe_documents),
+        "rag_mode": rag_mode,
+        "rag_error": rag_error,
+        "youtube_enabled": bool(get_runtime_env("YOUTUBE_API_KEY")),
+        "llm_generating": is_generation_active(),
+        "model_source": loaded_model_source,
+        "quantization": loaded_quantization,
+        "current_ingredients": current_ingredients,
+        "pending_ingredients": pending_ingredients,
+    }
+
+# ==========================================
+# 🔊 VARCO TTS 함수
+# ==========================================
+def _fetch_varco_voice(keyword: str) -> Optional[str]:
+    try:
+        res = requests.get(
+            "https://openapi.ai.nc.com/tts/lite/v1/api/voices/varco",
+            headers={"OPENAPI_KEY": VARCO_TTS_KEY},
+            timeout=10,
+        )
+        voices = res.json()
+        for v in voices:
+            if keyword and keyword in v.get("speaker_name", ""):
+                return v["speaker_uuid"]
+        if voices:
+            return voices[0]["speaker_uuid"]
+    except Exception as e:
+        print(f"⚠️ [VARCO] 화자 목록 조회 실패: {e}")
+    return None
+
+
+def _varco_tts_bytes(text: str) -> bytes:
+    data = {
+        "text": text[:400],
+        "language": "korean",
+        "voice": VARCO_TTS_VOICE,
+        "properties": {"speed": 1.0, "pitch": 1.0},
+        "return_metadata": False,
+    }
+    res = requests.post(
+        "https://openapi.ai.nc.com/tts/lite/v1/api/synthesize",
+        headers={"OPENAPI_KEY": VARCO_TTS_KEY},
+        json=data,
+        timeout=15,
+    )
+    audio_b64 = res.json().get("audio")
+    return base64.b64decode(audio_b64)
+
+
+def play_tts(text: str):
+    if not VARCO_TTS_KEY or not VARCO_TTS_VOICE:
+        return
+    clean_text = re.sub(r'[^\w\s가-힣?.!]', '', text)
+    if not clean_text:
+        return
+
+    filename = os.path.join(
+        tempfile.gettempdir(),
+        f"cooking_agent_voice_{os.getpid()}_{time.time_ns()}.wav",
+    )
+    mixer_initialized = False
+    try:
+        with tts_lock:
+            wav_bytes = _varco_tts_bytes(clean_text)
+            with open(filename, "wb") as f:
+                f.write(wav_bytes)
+            pygame.mixer.init()
+            mixer_initialized = True
+            pygame.mixer.music.load(filename)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                pygame.time.Clock().tick(10)
+    except Exception as e:
+        print(f"⚠️ [TTS] 재생 실패: {e}")
+    finally:
+        if mixer_initialized:
+            pygame.mixer.quit()
+        if os.path.exists(filename):
+            os.remove(filename)
+
+
+def queue_tts(background_tasks: BackgroundTasks, text: str) -> None:
+    if SERVER_TTS_ENABLED:
+        background_tasks.add_task(play_tts, text)
+
+# ==========================================
+# 🌐 API 엔드포인트
+# ==========================================
+class VisionData(BaseModel):
+    ingredients: list[str] = Field(default_factory=list)
+    action: str = "update"
+    allergy: str = ""
+    diet_goal: str = ""
+    tastes: list[str] = Field(default_factory=list)
+
+
+class STTData(BaseModel):
+    user_text: str
+    ingredients: list[str] = Field(default_factory=list)
+    current_step: int = 0
+    total_steps: int = 0
+    recipe_name: str = ""
+
+
+class CommunityPostData(BaseModel):
+    author: str
+    title: str
+    content: str
+
+
+class TTSData(BaseModel):
+    text: str
+
+
+def _clean_ingredients(ingredients: list[str]) -> list[str]:
+    cleaned = []
+    seen = set()
+    for ingredient in ingredients:
+        item = str(ingredient).strip()
+        if not item or item in seen:
+            continue
+        cleaned.append(item)
+        seen.add(item)
+    return cleaned
+
+
+def _cache_recipe_context(recipes: list[dict]) -> str:
+    context_lines = []
+    for i, recipe in enumerate(recipes):
+        context_lines.append(f"추천요리 {i+1}: {recipe['title']}")
+        context_lines.append(f"  - 전체 재료: {recipe['ingredients']}")
+        context_lines.append(f"  - 요리 방법: {recipe['steps']}")
+    return "\n".join(context_lines)
+
+
+def _search_recipes_fallback(user_ingredients: list[str], top_k: int = 2) -> list[dict]:
+    normalized_user = {
+        normalize_ingredient(ingredient)
+        for ingredient in user_ingredients
+        if str(ingredient).strip()
+    }
+    if not normalized_user:
+        return []
+
+    ranked = []
+    for doc in recipe_documents:
+        raw_ingredients = doc.metadata.get("normalized_ingredients", "")
+        recipe_ingredients = {
+            item.strip()
+            for item in raw_ingredients.split(",")
+            if item.strip()
+        }
+        if not recipe_ingredients:
+            continue
+
+        missing = recipe_ingredients - normalized_user
+        if missing:
+            continue
+
+        coverage = len(recipe_ingredients & normalized_user) / len(recipe_ingredients)
+        if coverage < 0.9:
+            continue
+
+        ranked.append((-len(recipe_ingredients), -coverage, doc))
+
+    ranked.sort(key=lambda item: (item[0], item[1], item[2].metadata.get("title", "")))
+    recipes = []
+    for _, _, doc in ranked[:top_k]:
+        recipes.append({
+            "title": doc.metadata["title"],
+            "ingredients": doc.metadata["ingredients"],
+            "steps": doc.metadata["steps"],
+            "source_type": doc.metadata["source_type"],
+            "similarity": 1.0,
+        })
+    return recipes
+
+
+def _search_available_recipes(user_ingredients: list[str], top_k: int = 2) -> list[dict]:
+    if not user_ingredients or (not vectorstore and not recipe_documents):
+        return []
+    if vectorstore:
+        return search_recipes(vectorstore, user_ingredients, top_k=top_k, min_score=0.9)
+    return _search_recipes_fallback(user_ingredients, top_k=top_k)
+
+
+def _refresh_cached_rag_for_ingredients(ingredients: list[str]) -> list[dict]:
+    global current_ingredients, cached_rag_context, cached_rag_matches
+
+    current_ingredients = _clean_ingredients(ingredients)
+    recipes = _search_available_recipes(current_ingredients, top_k=2)
+    if recipes:
+        cached_rag_context = _cache_recipe_context(recipes)
+        cached_rag_matches = [
+            {
+                "title": recipe["title"],
+                "similarity": recipe.get("similarity", 0),
+                "source_type": recipe.get("source_type", ""),
+            }
+            for recipe in recipes
+        ]
+    else:
+        cached_rag_context = (
+            "RAG 검색 결과 없음. 모델의 일반 요리 지식으로 답하되, "
+            "현재 인식된 재료 안에서 만들 수 있는 음식만 제안할 것."
+        )
+        cached_rag_matches = []
+    return recipes
+
+
+def _handle_confirmed_ingredients(
+    ingredients: list[str],
+    background_tasks: BackgroundTasks,
+    allergy: str = "",
+    diet_goal: str = "",
+    tastes: list[str] = [],
+) -> dict:
+    global current_ingredients, cached_rag_context, cached_rag_matches, chat_history
+
+    current_ingredients = _clean_ingredients(ingredients)
+    print(f"👁️ [Vision]: {current_ingredients}")
+
+    if not current_ingredients:
+        cached_rag_context = "없음"
+        cached_rag_matches = []
+        return {
+            "status": "success",
+            "recipes_found": 0,
+            "rag_loaded": vectorstore is not None or bool(recipe_documents),
+            "rag_mode": rag_mode,
+            "rag_matches": cached_rag_matches,
+            "message": "인식된 재료가 없습니다.",
+        }
+
+    if not vectorstore and not recipe_documents:
+        cached_rag_context = "없음"
+        cached_rag_matches = []
+        return {
+            "status": "success",
+            "recipes_found": 0,
+            "rag_loaded": False,
+            "rag_matches": cached_rag_matches,
+            "message": "RAG가 아직 준비되지 않았습니다.",
+        }
+
+    # 1. RAG 검색
+    print(f"🔍 RAG 검색 (재료 기반): {current_ingredients}")
+    rag_recipes = _search_available_recipes(current_ingredients, top_k=4)
+    print(f"📚 RAG에서 {len(rag_recipes)}개 레시피 발견")
+
+    # 2. 부족한 만큼 LLM으로 생성 (총 4개 채우기)
+    ai_recipes = []
+    needed_count = max(0, 4 - len(rag_recipes))
+    if pipe and needed_count > 0:
+        ing_str = ", ".join(current_ingredients)
+        print(f"🪄 LLM으로 {needed_count}개 레시피 추가 생성 중...")
+        user_context_lines = []
+        if allergy:
+            user_context_lines.append(f"- 알레르기: {allergy} (이 재료가 포함된 요리는 제안하지 마.)")
+        if diet_goal:
+            user_context_lines.append(f"- 식단 목표: {diet_goal}")
+        if tastes:
+            user_context_lines.append(f"- 선호 취향: {', '.join(tastes)}")
+        user_context = "\n".join(user_context_lines)
+
+        ax_prompt = (
+            f"<|im_start|>system\n너는 창의적이고 엄격한 전문 요리사야.\n"
+            f"제한 조건:\n"
+            f"1. 반드시 사용자가 제공한 재료 리스트에 포함된 재료들만 사용해.\n"
+            f"2. 리스트에 없는 재료는 절대 포함하지 마.\n"
+            f"3. 주어진 재료만으로 요리가 불가능하면 가장 간단한 요리라도 제안해.\n"
+            f"4. 답변은 반드시 JSON 리스트 형식으로만 해: "
+            f'[{{"title": "..", "ingredients": "..", "steps": ".."}}, ...]\n'
+            f"5. 모든 텍스트는 한국어로 작성해.\n"
+            f"6. steps는 반드시 '~해주세요', '~하시면 됩니다', '~해요' 형태의 존댓말로 작성해. '~한다', '~는다', '~담는다' 같은 서술형은 절대 쓰지 마.\n"
+            + (f"6. 사용자 정보를 반드시 반영해:\n{user_context}\n" if user_context else "")
+            + f"<|im_end|>\n"
+            f"<|im_start|>user\n재료 리스트: {ing_str}\n"
+            f"이 재료들만 사용해서 만들 수 있는 요리 {needed_count}개를 추천해줘.<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+        try:
+            out = pipe(ax_prompt, max_new_tokens=500, do_sample=False, max_length=None)
+            raw = out[0]["generated_text"].split("<|im_start|>assistant\n")[-1].split("<|im_end|>")[0].strip()
+            match = re.search(r"\[.*\]", raw, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group().replace("'", '"'))
+                for r in parsed[:needed_count]:
+                    r["source_type"] = "AI_Chef"
+                    r["similarity"] = 0.0
+                    ai_recipes.append(r)
+                print(f"✨ LLM 생성 완료: {[r['title'] for r in ai_recipes]}")
+        except Exception as e:
+            print(f"⚠️ LLM 레시피 생성 실패: {e}")
+
+    # 3. 합치기 (RAG 우선, AI로 나머지 채움)
+    recipes = (rag_recipes + ai_recipes)[:4]
+
+    if recipes:
+        cached_rag_context = _cache_recipe_context(recipes)
+        cached_rag_matches = [
+            {
+                "title": r["title"],
+                "similarity": r.get("similarity", 0),
+                "source_type": r.get("source_type", ""),
+            }
+            for r in recipes
+        ]
+        print(f"  -> 총 {len(recipes)}개 레시피 캐싱 (RAG {len(rag_recipes)}개 + AI {len(ai_recipes)}개)")
+        titles = ", ".join(r["title"] for r in recipes)
+        opening_line = f"재료로 만들 수 있는 요리 {len(recipes)}가지를 찾았어요! {titles} — 어떤 걸 만들어볼까요?"
+    else:
+        cached_rag_context = (
+            "RAG 및 LLM 검색 결과 없음. 모델의 일반 요리 지식으로 답하되, "
+            "현재 인식된 재료 안에서 만들 수 있는 음식만 제안할 것."
+        )
+        cached_rag_matches = []
+        opening_line = "가진 재료로 만들 수 있는 요리를 함께 찾아볼게요. 어떤 요리가 드시고 싶으세요?"
+
+    print(f"🗣️ [A.X Chef]: {opening_line}")
+    queue_tts(background_tasks, opening_line)
+    chat_history.append({"role": "assistant", "content": opening_line})
+
+    return {
+        "status": "success",
+        "recipes_found": len(recipes),
+        "rag_loaded": True,
+        "rag_mode": rag_mode,
+        "rag_matches": cached_rag_matches,
+        "recipes": recipes,
+        "message": opening_line,
+    }
+
+@app.post("/vision")
+async def update_vision(data: VisionData, background_tasks: BackgroundTasks):
+    global current_ingredients, pending_ingredients, cached_rag_context, cached_rag_matches
+
+    action = (data.action or "update").strip().lower()
+    ingredients = _clean_ingredients(data.ingredients)
+
+    if action == "ask_confirmation":
+        pending_ingredients = ingredients
+        if not pending_ingredients:
+            return {"status": "ignored", "reason": "no_ingredients"}
+
+        ingredient_text = ", ".join(pending_ingredients)
+        confirmation_line = f"{ingredient_text} 재료가 맞나요? 맞으면 엄지척, 아니면 주먹을 보여주세요."
+        print(f"🗣️ [A.X Chef]: {confirmation_line}")
+        queue_tts(background_tasks, confirmation_line)
+        return {
+            "status": "waiting_confirmation",
+            "ingredients": pending_ingredients,
+            "message": confirmation_line,
+        }
+
+    if action == "confirm":
+        confirmed = ingredients or pending_ingredients
+        pending_ingredients = []
+        return await run_in_threadpool(_handle_confirmed_ingredients, confirmed, background_tasks, data.allergy, data.diet_goal, data.tastes)
+
+    if action == "reject":
+        current_ingredients = []
+        pending_ingredients = []
+        cached_rag_context = "없음"
+        cached_rag_matches = []
+        rejection_line = "알겠습니다. 재료를 다시 인식해볼게요."
+        print(f"🗣️ [A.X Chef]: {rejection_line}")
+        queue_tts(background_tasks, rejection_line)
+        return {"status": "rejected", "message": rejection_line}
+
+    pending_ingredients = []
+    return await run_in_threadpool(_handle_confirmed_ingredients, ingredients, background_tasks, data.allergy, data.diet_goal, data.tastes)
+
+
+@app.get("/youtube-preview")
+async def youtube_preview(query: str = ""):
+    global last_video_recommendation
+    text = query.strip()
+    youtube_api_key = get_runtime_env("YOUTUBE_API_KEY")
+    wants_youtube = is_cooking_video_query(text) if text else False
+    youtube_status = {
+        "requested": wants_youtube,
+        "intent_source": "rule" if wants_youtube else "none",
+        "enabled": bool(youtube_api_key),
+        "message": "",
+    }
+
+    if not text or not wants_youtube:
+        return {
+            "requested": wants_youtube,
+            "video_recommendation": None,
+            "youtube_status": youtube_status,
+        }
+
+    if not youtube_api_key:
+        youtube_status["message"] = "YouTube API 키가 설정되지 않아 영상을 가져오지 못했습니다."
+        return {
+            "requested": True,
+            "video_recommendation": None,
+            "youtube_status": youtube_status,
+        }
+
+    try:
+        video_recommendation = await run_in_threadpool(
+            find_best_youtube_segment,
+            text,
+            youtube_api_key,
+        )
+        if video_recommendation:
+            last_video_recommendation = video_recommendation
+            youtube_status["message"] = "관련 유튜브 영상을 찾았습니다."
+        else:
+            youtube_error = get_last_youtube_error()
+            youtube_status["message"] = (
+                f"YouTube API 호출 실패: {youtube_error}"
+                if youtube_error
+                else "유튜브에서 관련 영상을 찾지 못했습니다."
+            )
+        return {
+            "requested": True,
+            "video_recommendation": video_recommendation,
+            "youtube_status": youtube_status,
+        }
+    except Exception as e:
+        print(f"⚠️ [YouTube] 프리뷰 생성 실패: {e}")
+        youtube_status["message"] = f"YouTube 프리뷰 생성 실패: {e}"
+        return {
+            "requested": True,
+            "video_recommendation": None,
+            "youtube_status": youtube_status,
+        }
+
+
+@app.post("/reset")
+async def reset_session():
+    global chat_history, current_ingredients, pending_ingredients, cached_rag_context, cached_rag_matches
+    generation_cancel_event.set()
+    chat_history = []
+    current_ingredients = []
+    pending_ingredients = []
+    cached_rag_context = "없음"
+    cached_rag_matches = []
+    print("🔄 [Server] 세션 초기화 완료")
+    return {"status": "reset"}
+
+
+@app.post("/cancel")
+async def cancel_generation():
+    was_active = is_generation_active()
+    generation_cancel_event.set()
+    try:
+        if pygame.mixer.get_init():
+            pygame.mixer.music.stop()
+    except Exception as exc:
+        print(f"⚠️ [Cancel] TTS 중단 실패: {exc}")
+    return {
+        "status": "cancelling" if was_active else "idle",
+        "was_active": was_active,
+    }
+
+
+def shutdown_llm_process() -> None:
+    time.sleep(0.5)
+    os._exit(0)
+
+
+@app.post("/shutdown")
+async def shutdown_llm():
+    generation_cancel_event.set()
+    try:
+        if pygame.mixer.get_init():
+            pygame.mixer.music.stop()
+    except Exception as exc:
+        print(f"⚠️ [Shutdown] TTS 중단 실패: {exc}")
+    threading.Thread(target=shutdown_llm_process, daemon=True).start()
+    return {"status": "shutting_down"}
+
+
+@app.post("/ask")
+async def ask_chef(data: STTData, background_tasks: BackgroundTasks):
+    global chat_history, cached_rag_context, last_video_recommendation
+    if pipe is None:
+        raise HTTPException(status_code=503, detail="LLM model is not loaded yet.")
+
+    payload_ingredients = _clean_ingredients(data.ingredients)
+    if payload_ingredients and set(payload_ingredients) != set(current_ingredients):
+        _refresh_cached_rag_for_ingredients(payload_ingredients)
+
+    youtube_api_key = get_runtime_env("YOUTUBE_API_KEY")
+
+    # 💡 저장된 RAG 검색 결과를 가져와 사용합니다.
+    rag_context = cached_rag_context
+
+    effective_ingredients = payload_ingredients or current_ingredients
+    ing_str = ", ".join(effective_ingredients) if effective_ingredients else "없음"
+
+    # 프롬프트 구성 — 유튜브 도구는 API 키가 있을 때만 노출하고, 레시피 검색 도구는 항상 노출한다.
+    prompt_template = SYSTEM_PROMPT.format(rag_context=rag_context)
+    tool_instruction = build_agent_tool_prompt(
+        youtube_enabled=bool(youtube_api_key),
+        steps_enabled=data.total_steps > 0,
+        transcript_enabled=bool(youtube_api_key) or last_video_recommendation is not None,
+    )
+
+    step_context = ""
+    if data.current_step > 0 and data.total_steps > 0:
+        step_context = (
+            f"\n현재 조리 중인 레시피: {data.recipe_name}."
+            f" 지금은 {data.current_step}/{data.total_steps} 단계입니다."
+            f" 반드시 현재 단계에 대한 안내만 하고, 사용자가 완료 신호를 줄 때까지 다음 단계로 넘어가지 마세요."
+            f" 단계 텍스트를 원문 그대로 말하지 말고 반드시 '~해주세요', '~하시면 돼요' 형태의 존댓말로 바꿔서 안내해."
+        )
+
+    prompt = (
+        f"<|im_start|>system\n{prompt_template}\n"
+        f"현재 사용 가능한 재료: {ing_str}\n"
+        "위 재료 목록에 없는 식재료는 추천하거나 조리 단계에 넣지 마세요."
+        f"{step_context}"
+        f"{tool_instruction}<|im_end|>\n"
+    )
+
+    # 이전 대화 추가
+    for hist in chat_history[-4:]:
+        prompt += f"<|im_start|>{hist['role']}\n{hist['content']}<|im_end|>\n"
+
+    # 현재 질문 추가
+    prompt += f"<|im_start|>user\n{data.user_text}<|im_end|>\n<|im_start|>assistant\n"
+
+    youtube_status = {
+        "requested": False,
+        "intent_source": "none",
+        "enabled": bool(youtube_api_key),
+        "message": "",
+    }
+    video_recommendation = None
+
+    def _cancelled_response():
+        return {
+            "answer": "응답 생성을 중단했습니다.",
+            "cancelled": True,
+            "video_recommendation": None,
+            "youtube_status": youtube_status,
+        }
+
+    # 에이전트 루프: LLM이 도구 호출을 출력하면 실행 결과를 돌려주고 다시 생성한다. (최대 MAX_AGENT_STEPS회)
+    agent_actions = []
+    current_prompt = prompt
+    try:
+        llm_answer = await run_in_threadpool(generate_llm_answer, current_prompt)
+    except GenerationCancelled:
+        return _cancelled_response()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    for agent_step in range(MAX_AGENT_STEPS):
+        tool_call = parse_tool_call(llm_answer)
+
+        if tool_call is None and agent_step == 0 and is_cooking_video_query(data.user_text):
+            # 안전망: 사용자가 명시적으로 영상을 요청했는데 모델이 도구를 안 불렀으면 보정한다.
+            tool_call = {"tool": "search_youtube_video", "query": "", "source": "rule_fallback"}
+
+        if tool_call is None:
+            break
+
+        tool_name = tool_call["tool"]
+        tool_source = tool_call.get("source", "agent")
+        if tool_source == "agent":
+            print(f"🤖 [Agent] 도구 호출({agent_step + 1}/{MAX_AGENT_STEPS}): {tool_name} query={tool_call['query']!r}")
+
+        action_extra = {}
+        if tool_name == "search_youtube_video":
+            youtube_status["requested"] = True
+            if youtube_status["intent_source"] == "none":
+                youtube_status["intent_source"] = tool_source
+
+            if not youtube_api_key:
+                youtube_status["message"] = "YouTube API 키가 설정되지 않아 영상을 가져오지 못했습니다."
+            else:
+                try:
+                    video_recommendation = await run_in_threadpool(
+                        find_best_youtube_segment,
+                        data.user_text,
+                        youtube_api_key,
+                        search_query=tool_call["query"] or None,
+                    )
+                    if video_recommendation:
+                        last_video_recommendation = video_recommendation
+                        youtube_status["message"] = "관련 유튜브 영상을 찾았습니다."
+                    else:
+                        youtube_error = get_last_youtube_error()
+                        youtube_status["message"] = (
+                            f"YouTube API 호출 실패: {youtube_error}"
+                            if youtube_error
+                            else "유튜브에서 관련 영상을 찾지 못했습니다."
+                        )
+                except Exception as e:
+                    print(f"⚠️ [YouTube] 추천 생성 실패: {e}")
+                    youtube_status["message"] = f"YouTube 추천 생성 실패: {e}"
+
+            tool_result_text = _format_tool_result(video_recommendation)
+            tool_followup_instruction = (
+                "영상을 찾지 못했습니다. 영상 언급 없이 말로 지금 필요한 조리 포인트 한 단계만 짧게 안내해주세요."
+            )
+            tool_success = video_recommendation is not None
+        elif tool_name == "set_timer":
+            timer_minutes = _extract_first_number(tool_call["query"])
+            action_extra["minutes"] = timer_minutes
+            if timer_minutes > 0:
+                tool_result_text = f"{timer_minutes}분 타이머가 설정되어 화면에서 자동으로 시작됩니다."
+                tool_followup_instruction = (
+                    f"{timer_minutes}분 타이머를 시작했다고 한 문장으로 알려주고, "
+                    "타이머가 도는 동안 할 일이 있으면 한 가지만 짧게 덧붙여주세요."
+                )
+                tool_success = True
+            else:
+                tool_result_text = "타이머 시간을 알 수 없어 설정하지 못했습니다."
+                tool_followup_instruction = "몇 분 타이머가 필요한지 한 문장으로 되물어주세요."
+                tool_success = False
+        elif tool_name == "goto_step":
+            target_step = _extract_first_number(tool_call["query"])
+            if data.total_steps > 0 and target_step > 0:
+                target_step = max(1, min(target_step, data.total_steps))
+            action_extra["step"] = target_step
+            if target_step > 0:
+                tool_result_text = f"화면이 {target_step}단계로 이동합니다."
+                tool_followup_instruction = (
+                    f"화면이 {target_step}단계로 이동했습니다. "
+                    f"{target_step}단계에서 지금 할 일 한 가지만 존댓말로 짧게 안내해주세요."
+                )
+                tool_success = True
+            else:
+                tool_result_text = "이동할 단계 번호를 알 수 없습니다."
+                tool_followup_instruction = "몇 단계로 이동할지 한 문장으로 되물어주세요."
+                tool_success = False
+        elif tool_name == "read_video_transcript":
+            transcript_video = video_recommendation or last_video_recommendation
+            transcript_text = await run_in_threadpool(_fetch_transcript_text, transcript_video)
+            if transcript_text:
+                video_title = (transcript_video or {}).get("title", "")
+                tool_result_text = f"영상 '{video_title}' 자막 내용:\n{transcript_text}"
+                tool_followup_instruction = (
+                    "위 자막 내용만 근거로 사용자의 질문에 두세 문장으로 답해주세요. "
+                    "자막에 없는 내용은 지어내지 마세요."
+                )
+                tool_success = True
+            else:
+                tool_result_text = (
+                    "자막을 가져오지 못했습니다."
+                    if transcript_video
+                    else "최근 추천된 영상이 없습니다."
+                )
+                tool_followup_instruction = (
+                    "영상 자막을 확인할 수 없다고 짧게 양해를 구하고, "
+                    "네 요리 지식으로 사용자의 질문에 두세 문장으로 답해주세요."
+                )
+                tool_success = False
+        else:  # search_recipe
+            found_recipes = _search_recipe_by_name(tool_call["query"])
+            tool_result_text = _format_recipe_tool_result(found_recipes)
+            tool_followup_instruction = (
+                "위 레시피를 참고하되 전체 순서를 나열하지 말고, 지금 시작할 첫 단계 한 가지만 존댓말로 짧게 안내해주세요."
+                if found_recipes
+                else "레시피 문서를 찾지 못했습니다. 네 일반 요리 지식으로, 현재 사용 가능한 재료 안에서 지금 필요한 안내 한 가지만 짧게 해주세요."
+            )
+            tool_success = bool(found_recipes)
+
+        action_entry = {
+            "tool": tool_name,
+            "query": tool_call["query"],
+            "source": tool_source,
+            "success": tool_success,
+        }
+        action_entry.update(action_extra)
+        agent_actions.append(action_entry)
+
+        # 영상을 찾았으면 LLM 추가 답변 없이 영상만 보여준다.
+        if tool_name == "search_youtube_video" and video_recommendation:
+            llm_answer = ""
+            break
+
+        # 도구 실행 결과를 대화에 이어붙이고 다음 답변을 생성한다.
+        current_prompt += (
+            f"{llm_answer}<|im_end|>\n"
+            "<|im_start|>user\n"
+            f"[도구 실행 결과: {tool_name}]\n{tool_result_text}\n{tool_followup_instruction}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        try:
+            llm_answer = await run_in_threadpool(generate_llm_answer, current_prompt)
+        except GenerationCancelled:
+            return _cancelled_response()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    # 모델이 도구 호출 마커를 또 출력했으면 제거한다.
+    llm_answer = strip_tool_calls(llm_answer)
+    if video_recommendation:
+        # 영상을 보여줄 때는 텍스트/음성 답변 없이 영상만 표시한다.
+        llm_answer = ""
+    elif not llm_answer:
+        llm_answer = "다시 한번 말씀해 주시겠어요?"
+
+    # 대화 기록 업데이트 (영상만 보여준 경우에도 맥락은 남긴다)
+    chat_history.append({"role": "user", "content": data.user_text})
+    chat_history.append({
+        "role": "assistant",
+        "content": llm_answer
+        or f"[유튜브 영상 추천: {video_recommendation.get('title', '')}]",
+    })
+
+    if llm_answer:
+        print(f"🔥 [A.X Chef]: {llm_answer}")
+        queue_tts(background_tasks, llm_answer)
+    else:
+        print(f"🎬 [A.X Chef]: 영상만 표시 — {video_recommendation.get('title', '')}")
+
+    return {
+        "answer": llm_answer,
+        "rag_matches": cached_rag_matches,
+        "video_recommendation": video_recommendation,
+        "youtube_status": youtube_status,
+        "agent_actions": agent_actions,
+    }
+
+
+@app.post("/tts")
+async def synthesize_speech(data: TTSData):
+    if not VARCO_TTS_KEY or not VARCO_TTS_VOICE:
+        raise HTTPException(status_code=503, detail="VARCO TTS가 설정되지 않았습니다.")
+    text = data.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="텍스트가 비어있습니다.")
+    clean = re.sub(r"[^\w\s가-힣?.!,]", " ", text)[:400].strip()
+    if not clean:
+        raise HTTPException(status_code=400, detail="유효한 텍스트가 없습니다.")
+
+    wav_bytes = await run_in_threadpool(_varco_tts_bytes, clean)
+    return StreamingResponse(
+        io.BytesIO(wav_bytes),
+        media_type="audio/wav",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.post("/gesture")
+async def detect_gesture(file: UploadFile = File(...)):
+    if not _mediapipe_available:
+        return {"gesture": "NONE"}
+    image_bytes = await file.read()
+    gesture = await run_in_threadpool(detect_hand_gesture, image_bytes)
+    return {"gesture": gesture}
+
+
+@app.post("/detect")
+async def detect_ingredients_from_image(file: UploadFile = File(...)):
+    if not _yolo_available:
+        raise HTTPException(status_code=503, detail="YOLO 라이브러리가 설치되지 않았습니다.")
+    if yolo_model is None:
+        raise HTTPException(status_code=503, detail="YOLO 모델이 로드되지 않았습니다. best.pt 파일을 확인하세요.")
+
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if img is None:
+        raise HTTPException(status_code=400, detail="이미지를 읽을 수 없습니다.")
+
+    h, w = img.shape[:2]
+    max_dim = 640
+    if max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+    CONF_THRES = 0.05
+    results = await run_in_threadpool(lambda: yolo_model.predict(img, conf=CONF_THRES, imgsz=640, verbose=False))
+
+    detected = []
+    seen = set()
+    for box in results[0].boxes:
+        confidence = float(box.conf[0])
+        class_id = int(box.cls[0])
+        class_name = yolo_model.names[class_id]
+        print(f"📸 [YOLO] {class_name}: {confidence:.4f}")
+        if class_name not in seen:
+            detected.append(class_name)
+            seen.add(class_name)
+
+    print(f"📸 [YOLO] 최종 인식된 재료: {detected}")
+    return {"ingredients": detected, "count": len(detected)}
+
+
+@app.get("/community")
+async def get_community_posts():
+    return {"posts": community_posts}
+
+
+@app.post("/community")
+async def create_community_post(data: CommunityPostData):
+    new_post = {
+        "id": int(time.time() * 1000),
+        "author": data.author.strip() or "익명",
+        "title": data.title.strip(),
+        "content": data.content.strip(),
+        "likes": 0,
+    }
+    community_posts.insert(0, new_post)
+    return new_post
+
+
+@app.post("/community/{post_id}/like")
+async def like_community_post(post_id: int):
+    for post in community_posts:
+        if post["id"] == post_id:
+            post["likes"] += 1
+            return post
+    raise HTTPException(status_code=404, detail="Post not found")
+
+
+@app.get("/generate-image")
+async def generate_recipe_image(recipe: str = Query(...)):
+    from google import genai as _genai
+
+    gemini_api_key = get_runtime_env("GEMINI_API_KEY")
+    if not gemini_api_key:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY가 설정되지 않았습니다.")
+
+    g_client = _genai.Client(api_key=gemini_api_key)
+    contents = [{"text": (
+        f"A highly realistic, crisp corporate food photography of {recipe}. "
+        "Consistent composition: always shot from a 45-degree overhead angle, food perfectly centered and filling 65% of the frame. "
+        "High-end DSLR camera with a 50mm lens, f/2.8, showcasing vivid textures and natural glossy sheen of the food. "
+        "Natural studio softbox lighting, clean micro-details, warm color temperature, subtle depth of field with a softly blurred neutral background. "
+        "Every image must use the exact same framing, angle, and lighting style. No text, no people, no hands, no props."
+    )}]
+
+    try:
+        resp = await run_in_threadpool(
+            lambda: g_client.models.generate_content(
+                model="gemini-2.5-flash-image",
+                contents=contents,
+            )
+        )
+        for part in resp.parts:
+            if part.inline_data is not None:
+                b64 = base64.b64encode(part.inline_data.data).decode()
+                mime = part.inline_data.mime_type or "image/jpeg"
+                return {"image_url": f"data:{mime};base64,{b64}"}
+        return {"image_url": None}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# React 빌드 파일 서빙 (npm run build 후 사용)
+_static_dir = FRONTEND_BUILD_DIR / "static"
+if _static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(_static_dir)), name="react-static")
+
+if FRONTEND_BUILD_DIR.exists():
+    @app.get("/{full_path:path}")
+    async def serve_react_app(full_path: str):
+        target = FRONTEND_BUILD_DIR / full_path
+        if target.is_file():
+            return FileResponse(str(target))
+        return FileResponse(str(FRONTEND_BUILD_DIR / "index.html"))
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    host = os.getenv("LLM_HOST", "0.0.0.0")
+    port = int(os.getenv("LLM_PORT", "8000"))
+    uvicorn.run(app, host=host, port=port)
